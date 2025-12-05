@@ -30,8 +30,8 @@ drilldown to PO item details using OO ALV technology.
 
 ## 📸 Screenshots
 
-![Dashboard](./Screenshots/dashboard_overview.png)
-![Item Drilldown](./Screenshots/item_drilldown.png)
+![Dashboard](ABAP-PO-Dashboard/Screenshots/dashboard_overview.png)
+![Item Drilldown](ABAP-PO-Dashboard/Screenshots/item_drilldown.png)
 
 ---
 
