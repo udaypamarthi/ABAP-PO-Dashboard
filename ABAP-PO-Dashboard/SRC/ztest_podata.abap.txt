@@ -1,0 +1,341 @@
+*&---------------------------------------------------------------------*
+*& Report  ZTEST_PODATA
+*&---------------------------------------------------------------------*
+*& Simple PO Dashboard with KPI + Drilldown
+*&---------------------------------------------------------------------*
+REPORT ztest_podata.
+
+*======================================================================*
+* DATA TYPES
+*======================================================================*
+TYPES: BEGIN OF ty_po_header,
+         ebeln     TYPE ekko-ebeln,   " PO Number
+         bukrs     TYPE ekko-bukrs,   " Company Code
+         lifnr     TYPE ekko-lifnr,   " Vendor Number
+         name1     TYPE lfa1-name1,   " Vendor Name
+         bedat     TYPE ekko-bedat,   " Doc Date
+         ekorg     TYPE ekko-ekorg,   " Purch Org
+         ernam     TYPE ekko-ernam,   " Created By
+         rlwrt     TYPE ekko-rlwrt,   " Net Value
+         waers     TYPE ekko-waers,   " Currency
+         row_color TYPE c LENGTH 4,   " For KPI Coloring (ALV info_fname)
+       END OF ty_po_header.
+
+TYPES: BEGIN OF ty_po_item,
+         ebelp TYPE ekpo-ebelp,
+         matnr TYPE ekpo-matnr,
+         txz01 TYPE ekpo-txz01,
+         menge TYPE ekpo-menge,
+         meins TYPE ekpo-meins,
+         netpr TYPE ekpo-netpr,
+       END OF ty_po_item.
+
+*======================================================================*
+* GLOBAL DATA
+*======================================================================*
+DATA: gt_po_header TYPE TABLE OF ty_po_header,
+      gs_po_header TYPE ty_po_header,
+      ok_code      TYPE sy-ucomm.
+
+* Main application object (for screen + UI handling)
+CLASS lcl_po_dashboard DEFINITION DEFERRED.
+DATA: go_app TYPE REF TO lcl_po_dashboard.
+
+*======================================================================*
+* SELECTION SCREEN
+*======================================================================*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE TEXT-001.
+SELECT-OPTIONS: s_ebeln FOR gs_po_header-ebeln,
+                s_date  FOR gs_po_header-bedat DEFAULT sy-datum.
+SELECTION-SCREEN END OF BLOCK b1.
+
+*======================================================================*
+* CLASS DEFINITIONS
+*======================================================================*
+
+" 1. EVENT HANDLER: Handles Hotspot Clicks on ALV
+CLASS lcl_event_handler DEFINITION.
+  PUBLIC SECTION.
+    METHODS:
+      on_hotspot_click FOR EVENT hotspot_click OF cl_gui_alv_grid
+        IMPORTING e_row_id e_column_id.
+ENDCLASS.
+
+" 2. MAIN APPLICATION: Handles Model and View logic
+CLASS lcl_po_dashboard DEFINITION.
+  PUBLIC SECTION.
+    DATA: o_docking  TYPE REF TO cl_gui_docking_container,
+          o_splitter TYPE REF TO cl_gui_splitter_container,
+          o_top_cont TYPE REF TO cl_gui_container,
+          o_bot_cont TYPE REF TO cl_gui_container,
+          o_grid     TYPE REF TO cl_gui_alv_grid,
+          o_html     TYPE REF TO cl_gui_html_viewer,
+          o_event    TYPE REF TO lcl_event_handler.
+
+    METHODS:
+      fetch_data,
+      run,
+      build_ui,
+      display_kpi,
+      display_alv,
+      show_items_popup IMPORTING iv_ebeln TYPE ekko-ebeln.
+ENDCLASS.
+
+*======================================================================*
+* CLASS IMPLEMENTATION: MAIN APPLICATION
+*======================================================================*
+CLASS lcl_po_dashboard IMPLEMENTATION.
+
+  METHOD run.
+    CALL SCREEN 100.
+  ENDMETHOD.
+
+  METHOD fetch_data.
+    " Fetch PO header data: EKKO + Vendor name from LFA1
+    CLEAR gt_po_header.
+
+    SELECT a~ebeln,
+           a~bukrs,
+           a~lifnr,
+           b~name1,
+           a~bedat,
+           a~ekorg,
+           a~ernam,
+           a~rlwrt,
+           a~waers
+      FROM ekko AS a
+      INNER JOIN lfa1 AS b
+        ON a~lifnr = b~lifnr
+      WHERE a~ebeln IN @s_ebeln
+        AND a~bedat IN @s_date
+      INTO CORRESPONDING FIELDS OF TABLE @gt_po_header
+      UP TO 100 ROWS.
+
+    " No data check
+    IF gt_po_header IS INITIAL.
+      MESSAGE 'No POs found for given criteria' TYPE 'S' DISPLAY LIKE 'E'.
+      RETURN.
+    ENDIF.
+
+    " KPI Logic: Color rows based on Spend Amount (RLWRT)
+    LOOP AT gt_po_header ASSIGNING FIELD-SYMBOL(<ls_po>).
+      IF <ls_po>-rlwrt > 50000.
+        <ls_po>-row_color = 'C600'. " Red (High Value/Risk)
+      ELSEIF <ls_po>-rlwrt < 5000.
+        <ls_po>-row_color = 'C500'. " Green (Low Value)
+      ELSE.
+        <ls_po>-row_color = 'C300'. " Yellow (Medium)
+      ENDIF.
+    ENDLOOP.
+  ENDMETHOD.
+
+  METHOD build_ui.
+    " Only create containers once
+    CHECK o_docking IS INITIAL.
+
+    " Docking Container (bottom, full width)
+    o_docking = NEW cl_gui_docking_container(
+                   side      = cl_gui_docking_container=>dock_at_bottom
+                   extension = 2000 ).
+
+    " Splitter: 2 Rows (Top = KPI / HTML, Bottom = ALV)
+    o_splitter = NEW cl_gui_splitter_container(
+                   parent  = o_docking
+                   rows    = 2
+                   columns = 1 ).
+
+    " Top: 20% height, for KPI
+    o_splitter->set_row_height(
+      id     = 1
+      height = 20 ).
+
+    o_top_cont = o_splitter->get_container( row = 1 column = 1 ).
+    o_bot_cont = o_splitter->get_container( row = 2 column = 1 ).
+
+    " Instantiate HTML viewer + ALV Grid
+    o_html = NEW cl_gui_html_viewer( parent = o_top_cont ).
+    o_grid = NEW cl_gui_alv_grid( i_parent = o_bot_cont ).
+
+    " Display KPI + ALV
+    display_kpi( ).
+    display_alv( ).
+  ENDMETHOD.
+
+  METHOD display_kpi.
+    " Calculate total spend and build small HTML KPI banner
+    DATA: lv_total TYPE ekko-rlwrt,
+          lv_curr  TYPE waers,
+          lt_html  TYPE w3htmltab,
+          lv_url   TYPE c LENGTH 255.
+
+    CLEAR: lv_total, lv_curr.
+
+    LOOP AT gt_po_header INTO DATA(ls_po).
+      ADD ls_po-rlwrt TO lv_total.
+      IF lv_curr IS INITIAL.
+        lv_curr = ls_po-waers.
+      ENDIF.
+    ENDLOOP.
+
+    " Simple HTML content
+    APPEND '<html><body style="background-color:#F0F8FF; font-family:sans-serif;">' TO lt_html.
+    APPEND '<h3>🛒 Procurement Dashboard</h3>' TO lt_html.
+
+    DATA(lv_total_str) = |{ lv_total NUMBER = USER }|.
+    DATA(lv_curr_str)  = COND string( WHEN lv_curr IS INITIAL THEN 'CUR' ELSE lv_curr ).
+
+    APPEND |<p>Total Spend Value: <b>{ lv_total_str }</b> ({ lv_curr_str })</p>| TO lt_html.
+    APPEND '</body></html>' TO lt_html.
+
+    o_html->load_data(
+      IMPORTING
+        assigned_url = lv_url
+      CHANGING
+        data_table   = lt_html ).
+
+    o_html->show_url( url = lv_url ).
+  ENDMETHOD.
+
+  METHOD display_alv.
+    DATA: lt_fcat TYPE lvc_t_fcat,
+          ls_layo TYPE lvc_s_layo.
+
+    " Layout Settings
+    CLEAR ls_layo.
+    ls_layo-zebra      = abap_true.
+    ls_layo-cwidth_opt = abap_true.
+    ls_layo-info_fname = 'ROW_COLOR'. " Use KPI colors
+
+    " Dynamic Field Catalog using RTTI
+    DATA(lo_descr)  = CAST cl_abap_tabledescr(
+                        cl_abap_typedescr=>describe_by_data( gt_po_header ) ).
+    DATA(lo_struct) = CAST cl_abap_structdescr( lo_descr->get_table_line_type( ) ).
+
+    LOOP AT lo_struct->components ASSIGNING FIELD-SYMBOL(<comp>).
+      APPEND INITIAL LINE TO lt_fcat ASSIGNING FIELD-SYMBOL(<fcat>).
+      <fcat>-fieldname = <comp>-name.
+      <fcat>-coltext   = <comp>-name.
+
+      " Make PO Number clickable (hotspot)
+      IF <fcat>-fieldname = 'EBELN'.
+        <fcat>-hotspot = abap_true.
+        <fcat>-coltext = 'PO Num (Drilldown)'.
+      ENDIF.
+
+      " Hide technical KPI color column
+      IF <fcat>-fieldname = 'ROW_COLOR'.
+        <fcat>-tech   = abap_true.
+        <fcat>-no_out = abap_true.
+      ENDIF.
+    ENDLOOP.
+
+    " Register hotspot event handler
+    o_event = NEW lcl_event_handler( ).
+    SET HANDLER o_event->on_hotspot_click FOR o_grid.
+
+    " Show ALV
+    o_grid->set_table_for_first_display(
+      EXPORTING
+        is_layout       = ls_layo
+      CHANGING
+        it_outtab       = gt_po_header
+        it_fieldcatalog = lt_fcat ).
+  ENDMETHOD.
+
+  METHOD show_items_popup.
+    " Drilldown: show EKPO items for chosen PO in SALV popup
+    DATA: lt_items     TYPE TABLE OF ty_po_item,
+          lo_alv_popup TYPE REF TO cl_salv_table.
+
+    SELECT ebelp,
+           matnr,
+           txz01,
+           menge,
+           meins,
+           netpr
+      FROM ekpo
+      INTO CORRESPONDING FIELDS OF TABLE @lt_items
+      WHERE ebeln = @iv_ebeln.
+
+    IF lt_items IS INITIAL.
+      MESSAGE 'No items found for this PO' TYPE 'S'.
+      RETURN.
+    ENDIF.
+
+    TRY.
+        cl_salv_table=>factory(
+          IMPORTING
+            r_salv_table = lo_alv_popup
+          CHANGING
+            t_table      = lt_items ).
+
+        lo_alv_popup->set_screen_popup(
+          start_column = 10
+          end_column   = 100
+          start_line   = 5
+          end_line     = 20 ).
+
+        lo_alv_popup->get_display_settings(
+          )->set_list_header( |Items for PO: { iv_ebeln }| ).
+
+        lo_alv_popup->display( ).
+
+      CATCH cx_salv_msg.
+        MESSAGE 'Error displaying item popup' TYPE 'S' DISPLAY LIKE 'E'.
+    ENDTRY.
+  ENDMETHOD.
+
+ENDCLASS.
+
+*======================================================================*
+* CLASS IMPLEMENTATION: EVENT HANDLER
+*======================================================================*
+CLASS lcl_event_handler IMPLEMENTATION.
+  METHOD on_hotspot_click.
+    " Triggered when user clicks on hotspot field (EBELN)
+    READ TABLE gt_po_header INTO DATA(ls_po) INDEX e_row_id-index.
+    IF sy-subrc = 0 AND e_column_id-fieldname = 'EBELN'.
+      " Use global application object for drilldown
+      IF go_app IS BOUND.
+        go_app->show_items_popup( ls_po-ebeln ).
+      ENDIF.
+    ENDIF.
+  ENDMETHOD.
+ENDCLASS.
+
+*======================================================================*
+* MAIN EXECUTION BLOCK
+*======================================================================*
+INITIALIZATION.
+  " Create main dashboard object
+  go_app = NEW lcl_po_dashboard( ).
+
+START-OF-SELECTION.
+  go_app->fetch_data( ).
+  go_app->run( ).
+
+*======================================================================*
+* DYNPRO 0100 LOGIC
+*======================================================================*
+* MODULE status_0100 OUTPUT
+*----------------------------------------------------------------------*
+MODULE status_0100 OUTPUT.
+  SET PF-STATUS 'ZSTATUS'. " Custom GUI status
+  SET TITLEBAR 'ZTITLE'.   " Custom title bar
+  IF go_app IS BOUND.
+    go_app->build_ui( ).  " Build containers, ALV, KPI
+  ENDIF.
+ENDMODULE.
+
+* MODULE user_command_0100 INPUT
+*----------------------------------------------------------------------*
+MODULE user_command_0100 INPUT.
+  ok_code = sy-ucomm.
+
+  CASE ok_code.
+    WHEN 'BACK' OR 'EXIT' OR 'CANC'.
+      LEAVE TO SCREEN 0.
+  ENDCASE.
+
+  CLEAR sy-ucomm.
+ENDMODULE.
